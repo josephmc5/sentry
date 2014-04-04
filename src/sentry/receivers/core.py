@@ -3,7 +3,7 @@ from django.contrib.auth.signals import user_logged_in
 from django.db.models.signals import post_syncdb, post_save, pre_delete
 from pkg_resources import parse_version as Version
 
-from sentry.constants import MEMBER_OWNER
+from sentry.constants import MEMBER_OWNER, MEMBER_USER
 from sentry.db.models import update
 from sentry.db.models.utils import slugify_instance
 from sentry.models import (
@@ -163,6 +163,13 @@ def on_alert_creation(instance, **kwargs):
     for plugin in plugins.for_project(instance.project):
         safe_execute(plugin.on_alert, alert=instance)
 
+def add_user_to_projects(request, user, **kwargs):
+    for team in Team.objects.all():
+        if not Project.objects.filter(id=settings.SENTRY_PROJECT,team=team).exists():
+            TeamMember.objects.get_or_create(
+                type=MEMBER_USER,
+                user=user,
+                team=team)
 
 # Signal registration
 post_syncdb.connect(
@@ -191,6 +198,11 @@ pre_delete.connect(
 user_logged_in.connect(
     set_language_on_logon,
     dispatch_uid="set_language_on_logon",
+    weak=False
+)
+user_logged_in.connect(
+    add_user_to_projects,
+    dispatch_uid="add_user_to_projects",
     weak=False
 )
 post_save.connect(
