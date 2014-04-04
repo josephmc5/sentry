@@ -167,7 +167,6 @@ def add_user_to_projects(request, user, **kwargs):
     for team in Team.objects.all():
         if not Project.objects.filter(id=settings.SENTRY_PROJECT,team=team).exists():
             TeamMember.objects.get_or_create(
-                type=MEMBER_USER,
                 user=user,
                 team=team)
 
