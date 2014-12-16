@@ -5,8 +5,7 @@ sentry.models.activity
 :copyright: (c) 2010-2014 by the Sentry Team, see AUTHORS for more details.
 :license: BSD, see LICENSE for more details.
 """
-
-import logging
+from __future__ import absolute_import
 
 from django.conf import settings
 from django.db import models
@@ -28,6 +27,8 @@ class Activity(Model):
     CREATE_ISSUE = 7
     NOTE = 8
     FIRST_SEEN = 9
+    RELEASE = 10
+    ASSIGNED = 11
 
     TYPE = (
         # (TYPE, verb-slug)
@@ -40,6 +41,8 @@ class Activity(Model):
         (CREATE_ISSUE, 'create_issue'),
         (NOTE, 'note'),
         (FIRST_SEEN, 'first_seen'),
+        (RELEASE, 'release'),
+        (ASSIGNED, 'assigned'),
     )
 
     project = models.ForeignKey('sentry.Project')
@@ -96,9 +99,7 @@ class Activity(Model):
         if self.project.team:
             # fetch team members
             user_id_list |= set(
-                u_id for u_id in self.project.team.member_set.filter(
-                    user__is_active=True,
-                ).exclude(
+                u_id for u_id in self.project.team.member_set.exclude(
                     user__id=self.user_id,
                 ).values_list('user', flat=True)
             )
@@ -124,7 +125,7 @@ class Activity(Model):
         if subject_prefix:
             subject_prefix = subject_prefix.rstrip() + ' '
 
-        subject = '%s%s' % (subject_prefix, self.event.get_email_subject())
+        subject = '%s%s' % (subject_prefix, self.group.get_email_subject())
 
         context = {
             'text': self.data['text'],
@@ -147,9 +148,4 @@ class Activity(Model):
             reply_reference=self.group,
         )
         msg.add_users(send_to, project=self.project)
-
-        try:
-            msg.send()
-        except Exception as e:
-            logger = logging.getLogger('sentry.mail.errors')
-            logger.exception(e)
+        msg.send_async()

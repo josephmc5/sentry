@@ -6,7 +6,7 @@ import mock
 
 from django.core.urlresolvers import reverse
 from django.http import HttpRequest
-from exam import before, fixture
+from exam import fixture
 from social_auth.models import UserSocialAuth
 
 from sentry.models import UserOption, LostPasswordHash, User
@@ -34,8 +34,9 @@ class LoginTest(TestCase):
             'password': 'bizbar',
         })
         assert resp.status_code == 200
-        assert resp.context['form'].errors['__all__'] == \
-            [u'Please enter a correct username and password. Note that both fields may be case-sensitive.']
+        assert resp.context['form'].errors['__all__'] == [
+            u'Please enter a correct username and password. Note that both fields may be case-sensitive.'
+        ]
 
     def test_valid_credentials(self):
         # load it once for test cookie
@@ -214,11 +215,6 @@ class LoginRedirectTest(TestCase):
         assert resp.status_code == 302
         assert resp['Location'] == reverse('sentry')
 
-    def test_standard_view_works(self):
-        resp = login_redirect(self.make_request(reverse('sentry', args=[1])))
-        assert resp.status_code == 302
-        assert resp['Location'] == reverse('sentry', args=[1])
-
 
 class NotificationSettingsTest(TestCase):
     @fixture
@@ -287,7 +283,7 @@ class RecoverPasswordTest(TestCase):
 
     def test_invalid_username(self):
         resp = self.client.post(self.path, {
-            'user': 'nonexistant'
+            'user': 'nonexistent'
         })
         assert resp.status_code == 200
         self.assertTemplateUsed(resp, 'sentry/account/recover/index.html')
@@ -306,8 +302,8 @@ class RecoverPasswordTest(TestCase):
 
 
 class RecoverPasswordConfirmTest(TestCase):
-    @before
-    def create_hash(self):
+    def setUp(self):
+        super(RecoverPasswordConfirmTest, self).setUp()
         self.password_hash = LostPasswordHash.objects.create(user=self.user)
 
     @fixture

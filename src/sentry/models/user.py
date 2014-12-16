@@ -5,16 +5,20 @@ sentry.models.user
 :copyright: (c) 2010-2014 by the Sentry Team, see AUTHORS for more details.
 :license: BSD, see LICENSE for more details.
 """
+from __future__ import absolute_import
 
 import warnings
 
-from django.contrib.auth.models import AbstractBaseUser
+from django.contrib.auth.models import AbstractBaseUser, UserManager
 from django.db import models
 from django.utils import timezone
 from django.utils.translation import ugettext_lazy as _
 
-from sentry.db.models import Model
-from sentry.manager import UserManager
+from sentry.db.models import BaseManager, Model
+
+
+class UserManager(BaseManager, UserManager):
+    pass
 
 
 class User(Model, AbstractBaseUser):
@@ -34,6 +38,12 @@ class User(Model, AbstractBaseUser):
         _('superuser status'), default=False,
         help_text=_('Designates that this user has all permissions without '
                     'explicitly assigning them.'))
+    is_managed = models.BooleanField(
+        _('managed'), default=False,
+        help_text=_('Designates whether this user should be treated as '
+                    'managed. Select this to disallow the user from '
+                    'modifying their account (username, password, etc).'))
+
     date_joined = models.DateTimeField(_('date joined'), default=timezone.now)
 
     objects = UserManager(cache_fields=['pk'])
@@ -69,17 +79,22 @@ class User(Model, AbstractBaseUser):
     def merge_to(from_user, to_user):
         # TODO: we could discover relations automatically and make this useful
         from sentry.models import (
-            GroupBookmark, Project, ProjectKey, Team, TeamMember, UserOption)
+            GroupBookmark, Organization, OrganizationMember, ProjectKey, Team,
+            UserOption
+        )
 
+        for obj in Organization.objects.filter(owner=from_user):
+            obj.update(owner=to_user)
         for obj in ProjectKey.objects.filter(user=from_user):
             obj.update(user=to_user)
-        for obj in TeamMember.objects.filter(user=from_user):
+        for obj in OrganizationMember.objects.filter(user=from_user):
             obj.update(user=to_user)
-        for obj in Project.objects.filter(owner=from_user):
-            obj.update(owner=to_user)
         for obj in Team.objects.filter(owner=from_user):
             obj.update(owner=to_user)
         for obj in GroupBookmark.objects.filter(user=from_user):
             obj.update(user=to_user)
         for obj in UserOption.objects.filter(user=from_user):
             obj.update(user=to_user)
+
+    def get_display_name(self):
+        return self.first_name or self.username

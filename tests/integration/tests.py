@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 
-from __future__ import absolute_import
+from __future__ import absolute_import, print_function
 
 import datetime
 import json
@@ -15,7 +15,7 @@ from gzip import GzipFile
 from exam import fixture
 from raven import Client
 
-from sentry.models import Group, Event, Project, User
+from sentry.models import Group, Event
 from sentry.testutils import TestCase
 from sentry.testutils.helpers import get_auth_header
 from sentry.utils.compat import StringIO
@@ -75,8 +75,9 @@ class RavenIntegrationTest(TestCase):
     happen between Raven <--> Sentry over HTTP communication.
     """
     def setUp(self):
-        self.user = User.objects.create(username='coreapi')
-        self.project = Project.objects.create(owner=self.user, name='Foo', slug='bar')
+        self.user = self.create_user('coreapi@example.com')
+        self.team = self.create_team(owner=self.user)
+        self.project = self.create_project(team=self.team)
         self.pm = self.project.team.member_set.get_or_create(user=self.user)[0]
         self.pk = self.project.key_set.get_or_create(user=self.user)[0]
 
@@ -103,7 +104,9 @@ class RavenIntegrationTest(TestCase):
             dsn='http://%s:%s@localhost:8000/%s' % (
                 self.pk.public_key, self.pk.secret_key, self.pk.project_id)
         )
-        client.capture('Message', message='foo')
+
+        with self.settings(CELERY_ALWAYS_EAGER=True):
+            client.capture('Message', message='foo')
 
         send_remote.assert_called_once()
         self.assertEquals(Group.objects.count(), 1)
@@ -155,45 +158,34 @@ class SentryRemoteTest(TestCase):
         self.assertEquals(group.last_seen, timestamp)
 
     def test_ungzipped_data(self):
-        kwargs = {'message': 'hello', 'server_name': 'not_dcramer.local',
-                  'level': 40, 'site': 'not_a_real_site'}
+        kwargs = {'message': 'hello'}
         resp = self._postWithSignature(kwargs)
         self.assertEquals(resp.status_code, 200)
         instance = Event.objects.get()
         self.assertEquals(instance.message, 'hello')
-        self.assertEquals(instance.server_name, 'not_dcramer.local')
-        self.assertEquals(instance.site, 'not_a_real_site')
-        self.assertEquals(instance.level, 40)
 
     @override_settings(SENTRY_ALLOW_ORIGIN='getsentry.com')
     def test_correct_data_with_get(self):
-        kwargs = {'message': 'hello', 'server_name': 'not_dcramer.local',
-                  'level': 40, 'site': 'not_a_real_site'}
+        kwargs = {'message': 'hello'}
         resp = self._getWithReferer(kwargs)
         self.assertEquals(resp.status_code, 200, resp.content)
         instance = Event.objects.get()
         self.assertEquals(instance.message, 'hello')
-        self.assertEquals(instance.server_name, 'not_dcramer.local')
-        self.assertEquals(instance.level, 40)
-        self.assertEquals(instance.site, 'not_a_real_site')
 
     @override_settings(SENTRY_ALLOW_ORIGIN='getsentry.com')
     def test_get_without_referer(self):
-        kwargs = {'message': 'hello', 'server_name': 'not_dcramer.local',
-                  'level': 40, 'site': 'not_a_real_site'}
+        kwargs = {'message': 'hello'}
         resp = self._getWithReferer(kwargs, referer=None, protocol='4')
         self.assertEquals(resp.status_code, 400, resp.content)
 
     @override_settings(SENTRY_ALLOW_ORIGIN='*')
     def test_get_without_referer_allowed(self):
-        kwargs = {'message': 'hello', 'server_name': 'not_dcramer.local',
-                  'level': 40, 'site': 'not_a_real_site'}
+        kwargs = {'message': 'hello'}
         resp = self._getWithReferer(kwargs, referer=None, protocol='4')
         self.assertEquals(resp.status_code, 200, resp.content)
 
     def test_signature(self):
-        kwargs = {'message': 'hello', 'server_name': 'not_dcramer.local',
-                  'level': 40, 'site': 'not_a_real_site'}
+        kwargs = {'message': 'hello'}
 
         resp = self._postWithSignature(kwargs)
 
@@ -202,9 +194,6 @@ class SentryRemoteTest(TestCase):
         instance = Event.objects.get()
 
         self.assertEquals(instance.message, 'hello')
-        self.assertEquals(instance.server_name, 'not_dcramer.local')
-        self.assertEquals(instance.site, 'not_a_real_site')
-        self.assertEquals(instance.level, 40)
 
     def test_content_encoding_deflate(self):
         kwargs = {'message': 'hello'}
@@ -214,12 +203,13 @@ class SentryRemoteTest(TestCase):
         key = self.projectkey.public_key
         secret = self.projectkey.secret_key
 
-        resp = self.client.post(
-            self.path, message,
-            content_type='application/octet-stream',
-            HTTP_CONTENT_ENCODING='deflate',
-            HTTP_X_SENTRY_AUTH=get_auth_header('_postWithHeader', key, secret),
-        )
+        with self.settings(CELERY_ALWAYS_EAGER=True):
+            resp = self.client.post(
+                self.path, message,
+                content_type='application/octet-stream',
+                HTTP_CONTENT_ENCODING='deflate',
+                HTTP_X_SENTRY_AUTH=get_auth_header('_postWithHeader', key, secret),
+            )
 
         assert resp.status_code == 200, resp.content
 
@@ -234,18 +224,23 @@ class SentryRemoteTest(TestCase):
         message = json.dumps(kwargs)
 
         fp = StringIO()
-        with GzipFile(fileobj=fp, mode='w') as f:
-            return f.write(message)
+
+        try:
+            f = GzipFile(fileobj=fp, mode='w')
+            f.write(message)
+        finally:
+            f.close()
 
         key = self.projectkey.public_key
         secret = self.projectkey.secret_key
 
-        resp = self.client.post(
-            self.path, fp.getvalue(),
-            content_type='application/octet-stream',
-            CONTENT_ENCODING='gzip',
-            HTTP_X_SENTRY_AUTH=get_auth_header('_postWithHeader', key, secret),
-        )
+        with self.settings(CELERY_ALWAYS_EAGER=True):
+            resp = self.client.post(
+                self.path, fp.getvalue(),
+                content_type='application/octet-stream',
+                HTTP_CONTENT_ENCODING='gzip',
+                HTTP_X_SENTRY_AUTH=get_auth_header('_postWithHeader', key, secret),
+            )
 
         assert resp.status_code == 200, resp.content
 

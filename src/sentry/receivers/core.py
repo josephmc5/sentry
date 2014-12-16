@@ -1,79 +1,118 @@
+from __future__ import absolute_import, print_function
+
 from django.conf import settings
 from django.contrib.auth.signals import user_logged_in
-from django.db.models.signals import post_syncdb, post_save, pre_delete
+from django.db import connections
+from django.db.models.signals import post_syncdb, post_save
 from pkg_resources import parse_version as Version
 
-from sentry.constants import MEMBER_OWNER, MEMBER_USER
-from sentry.db.models import update
-from sentry.db.models.utils import slugify_instance
+from sentry import options
 from sentry.models import (
-    Project, User, Option, Team, ProjectKey, UserOption, TagKey, TagValue,
-    GroupTag, GroupTagKey, Activity, TeamMember, Alert)
+    Organization, OrganizationMemberType, Project, User, Team, ProjectKey,
+    UserOption, TagKey, TagValue, GroupTagValue, GroupTagKey, Activity,
+    Alert
+)
 from sentry.signals import buffer_incr_complete, regression_signal
 from sentry.utils.safe import safe_execute
 
+PROJECT_SEQUENCE_FIX = """
+SELECT setval('sentry_project_id_seq', (
+    SELECT GREATEST(MAX(id) + 1, nextval('sentry_project_id_seq')) - 1
+    FROM sentry_project))
+"""
 
-def create_default_project(created_models, verbosity=2, **kwargs):
+
+def create_default_projects(created_models, verbosity=2, **kwargs):
     if Project not in created_models:
         return
-    if Project.objects.filter(id=settings.SENTRY_PROJECT).exists():
+
+    create_default_project(
+        id=settings.SENTRY_PROJECT,
+        name='Backend',
+        slug='backend',
+        verbosity=verbosity,
+        platform='django',
+    )
+    if settings.SENTRY_FRONTEND_PROJECT:
+        project = create_default_project(
+            id=settings.SENTRY_FRONTEND_PROJECT,
+            name='Frontend',
+            slug='frontend',
+            verbosity=verbosity,
+            platform='javascript'
+        )
+
+
+def create_default_project(id, name, slug, verbosity=2, **kwargs):
+    if Project.objects.filter(id=id).exists():
         return
 
     try:
         user = User.objects.filter(is_superuser=True)[0]
     except IndexError:
-        user = None
+        user, _ = User.objects.get_or_create(
+            username='sentry',
+            defaults={
+                'email': 'sentry@localhost',
+            }
+        )
+
+    org, _ = Organization.objects.get_or_create(
+        name='Sentry',
+        defaults={
+            'owner': user,
+        }
+    )
+
+    team, _ = Team.objects.get_or_create(
+        name='Sentry',
+        defaults={
+            'owner': org.owner,
+            'organization': org,
+        }
+    )
 
     project = Project.objects.create(
+        id=id,
         public=False,
-        name='Sentry (Internal)',
-        slug='sentry',
-        owner=user,
-        platform='django',
+        name=name,
+        slug=slug,
+        team=team,
+        organization=team.organization,
+        **kwargs
     )
+
     # HACK: manually update the ID after insert due to Postgres
     # sequence issues. Seriously, fuck everything about this.
-    # TODO(dcramer): find a better solution
-    if project.id != settings.SENTRY_PROJECT:
-        project.key_set.all().delete()
-        project.update(id=settings.SENTRY_PROJECT)
-        create_team_and_keys_for_project(project, created=True)
+    connection = connections[project._state.db]
+    if connection.settings_dict['ENGINE'].endswith('psycopg2'):
+        cursor = connection.cursor()
+        cursor.execute(PROJECT_SEQUENCE_FIX)
+
+    project.update_option('sentry:origins', ['*'])
 
     if verbosity > 0:
-        print 'Created internal Sentry project (slug=%s, id=%s)' % (project.slug, project.id)
+        print('Created internal Sentry project (slug=%s, id=%s)' % (project.slug, project.id))
+
+    return project
 
 
 def set_sentry_version(latest=None, **kwargs):
     import sentry
     current = sentry.get_version()
 
-    version = Option.objects.get_value(
-        key='sentry:latest_version',
-        default=''
-    )
+    version = options.get('sentry:latest_version')
 
     for ver in (current, version):
         if Version(ver) >= Version(latest):
             return
 
-    Option.objects.set_value(
-        key='sentry:latest_version',
-        value=(latest or current)
-    )
+    options.set('sentry:latest_version', (latest or current))
 
 
-def create_team_and_keys_for_project(instance, created, **kwargs):
+def create_keys_for_project(instance, created, **kwargs):
     if not created or kwargs.get('raw'):
         return
-
-    if not instance.owner:
-        return
-
-    if not instance.team:
-        team = Team(owner=instance.owner, name=instance.name)
-        slugify_instance(team, instance.slug)
-        team.save()
-        update(instance, team=team)
 
     if not ProjectKey.objects.filter(project=instance, user__isnull=True).exists():
         ProjectKey.objects.create(
@@ -81,7 +120,7 @@ def create_team_and_keys_for_project(instance, created, **kwargs):
         )
 
 
-def create_team_member_for_owner(instance, created, **kwargs):
+def create_org_member_for_owner(instance, created, **kwargs):
     if not created:
         return
 
@@ -90,16 +129,9 @@ def create_team_member_for_owner(instance, created, **kwargs):
 
     instance.member_set.get_or_create(
         user=instance.owner,
-        type=MEMBER_OWNER,
+        type=OrganizationMemberType.OWNER,
+        has_global_access=True,
     )
-
-
-def remove_key_for_team_member(instance, **kwargs):
-    for project in instance.team.project_set.all():
-        ProjectKey.objects.filter(
-            project=project,
-            user=instance.user,
-        ).delete()
 
 
 # Set user language if set
@@ -129,7 +161,7 @@ def record_project_tag_count(filters, created, **kwargs):
     })
 
 
-@buffer_incr_complete.connect(sender=GroupTag, weak=False)
+@buffer_incr_complete.connect(sender=GroupTagValue, weak=False)
 def record_group_tag_count(filters, created, **kwargs):
     from sentry import app
 
@@ -172,26 +204,20 @@ def add_user_to_projects(request, user, **kwargs):
 
 # Signal registration
 post_syncdb.connect(
-    create_default_project,
+    create_default_projects,
     dispatch_uid="create_default_project",
     weak=False,
 )
 post_save.connect(
-    create_team_and_keys_for_project,
+    create_keys_for_project,
     sender=Project,
-    dispatch_uid="create_team_and_keys_for_project",
+    dispatch_uid="create_keys_for_project",
     weak=False,
 )
 post_save.connect(
-    create_team_member_for_owner,
-    sender=Team,
-    dispatch_uid="create_team_member_for_owner",
-    weak=False,
-)
-pre_delete.connect(
-    remove_key_for_team_member,
-    sender=TeamMember,
-    dispatch_uid="remove_key_for_team_member",
+    create_org_member_for_owner,
+    sender=Organization,
+    dispatch_uid="create_org_member_for_owner",
     weak=False,
 )
 user_logged_in.connect(

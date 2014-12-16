@@ -5,6 +5,8 @@ sentry.web.frontend.projects
 :copyright: (c) 2012 by the Sentry Team, see AUTHORS for more details.
 :license: BSD, see LICENSE for more details.
 """
+from __future__ import absolute_import
+
 from django.core.urlresolvers import reverse
 from django.http import HttpResponseRedirect
 
@@ -17,15 +19,13 @@ from sentry.web.helpers import render_to_response, render_to_string, get_raven_j
 
 def get_key_context(user, project):
     try:
-        key = ProjectKey.objects.get(user=user, project=project)
-    except ProjectKey.DoesNotExist:
-        try:
-            key = ProjectKey.objects.filter(
-                project=project,
-                user__isnull=True,
-            )[0]
-        except IndexError:
-            key = None
+        key = ProjectKey.objects.filter(
+            project=project,
+            user__isnull=True,
+            roles=ProjectKey.roles.store,
+        )[0]
+    except IndexError:
+        key = None
 
     if key is None:
         dsn = 'SENTRY_DSN'
@@ -43,11 +43,12 @@ def get_key_context(user, project):
 
 
 @has_access
-def client_help(request, team, project):
+def client_help(request, organization, project):
     context = {
         'page': 'client_help',
-        'project': project,
+        'organization': organization,
         'team': project.team,
+        'project': project,
         'SUBSECTION': 'projects',
         'SECTION': 'team',
     }
@@ -57,7 +58,7 @@ def client_help(request, team, project):
 
 
 @has_access
-def client_guide(request, team, project, platform):
+def client_guide(request, organization, project, platform):
     if platform not in PLATFORM_LIST:
         return HttpResponseRedirect(reverse('sentry'))
 
@@ -66,9 +67,10 @@ def client_guide(request, team, project, platform):
     context = {
         'platform': platform,
         'platform_title': PLATFORM_TITLES.get(platform, platform.title()),
+        'organization': organization,
+        'team': project.team,
         'project': project,
         'page': 'client_help_%s' % (PLATFORM_ROOTS.get(platform, platform),),
-        'team': project.team,
         'SUBSECTION': 'projects',
         'SECTION': 'team',
     }

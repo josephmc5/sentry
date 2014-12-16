@@ -5,8 +5,18 @@ sentry.testutils.fixtures
 :copyright: (c) 2010-2014 by the Sentry Team, see AUTHORS for more details.
 :license: BSD, see LICENSE for more details.
 """
+from __future__ import absolute_import, print_function, unicode_literals
+
+import six
+
+from django.utils.text import slugify
 from exam import fixture
-from sentry.models import Activity, Event, Group, Project, Team, User
+from uuid import uuid4
+
+from sentry.models import (
+    Activity, Event, Group, Organization, OrganizationMember,
+    OrganizationMemberType, Project, Team, User
+)
 from sentry.utils.compat import pickle
 from sentry.utils.strings import decompress
 
@@ -18,24 +28,34 @@ LEGACY_DATA = pickle.loads(decompress("""eJy9WW1v20YS/q5fwfqLpECluMvXFSzjgKK9Bri
 class Fixtures(object):
     @fixture
     def projectkey(self):
-        return self.project.key_set.get_or_create(user=self.user)[0]
+        return self.create_project_key(project=self.project, user=self.user)
 
     @fixture
     def user(self):
-        return self.create_user('admin@localhost', username='admin')
+        return self.create_user('admin@localhost', is_superuser=True)
 
     @fixture
-    def team(self):
-        return Team.objects.create(
-            name='foo',
-            slug='foo',
+    def organization(self):
+        # XXX(dcramer): ensure that your org slug doesnt match your team slug
+        # and the same for your project slug
+        return self.create_organization(
+            name='baz',
+            slug='baz',
             owner=self.user,
         )
 
     @fixture
+    def team(self):
+        return self.create_team(
+            organization=self.organization,
+            name='foo',
+            slug='foo',
+            owner=self.organization.owner,
+        )
+
+    @fixture
     def project(self):
-        return Project.objects.create(
-            owner=self.user,
+        return self.create_project(
             name='Bar',
             slug='bar',
             team=self.team,
@@ -43,7 +63,7 @@ class Fixtures(object):
 
     @fixture
     def group(self):
-        return self.create_group()
+        return self.create_group(message='Foo bar')
 
     @fixture
     def event(self):
@@ -57,10 +77,54 @@ class Fixtures(object):
             data={}
         )
 
-    def create_user(self, email, **kwargs):
+    def create_organization(self, **kwargs):
+        kwargs.setdefault('name', uuid4().hex)
+        if not kwargs.get('owner'):
+            kwargs['owner'] = self.user
+
+        return Organization.objects.create(**kwargs)
+
+    def create_member(self, teams=None, **kwargs):
+        kwargs.setdefault('type', OrganizationMemberType.MEMBER)
+
+        om = OrganizationMember.objects.create(**kwargs)
+        if teams:
+            for team in teams:
+                om.teams.add(team)
+        return om
+
+    def create_team(self, **kwargs):
+        kwargs.setdefault('name', uuid4().hex)
+        if not kwargs.get('slug'):
+            kwargs['slug'] = slugify(six.text_type(kwargs['name']))
+        if not kwargs.get('organization'):
+            kwargs['organization'] = self.organization
+        if not kwargs.get('owner'):
+            kwargs['owner'] = kwargs['organization'].owner
+
+        return Team.objects.create(**kwargs)
+
+    def create_project(self, **kwargs):
+        kwargs.setdefault('name', uuid4().hex)
+        if not kwargs.get('slug'):
+            kwargs['slug'] = slugify(six.text_type(kwargs['name']))
+        if not kwargs.get('team'):
+            kwargs['team'] = self.team
+        if not kwargs.get('organization'):
+            kwargs['organization'] = kwargs['team'].organization
+
+        return Project.objects.create(**kwargs)
+
+    def create_project_key(self, project, user):
+        return project.key_set.get_or_create(user=user)[0]
+
+    def create_user(self, email=None, **kwargs):
+        if not email:
+            email = uuid4().hex + '@example.com'
+
         kwargs.setdefault('username', email)
         kwargs.setdefault('is_staff', True)
-        kwargs.setdefault('is_superuser', True)
+        kwargs.setdefault('is_superuser', False)
 
         user = User(email=email, **kwargs)
         user.set_password('admin')
@@ -68,12 +132,19 @@ class Fixtures(object):
 
         return user
 
-    def create_event(self, event_id, **kwargs):
+    def create_event(self, event_id=None, **kwargs):
         if 'group' not in kwargs:
             kwargs['group'] = self.group
         kwargs.setdefault('project', kwargs['group'].project)
-        kwargs.setdefault('message', 'Foo bar')
-        kwargs.setdefault('data', LEGACY_DATA)
+        kwargs.setdefault('message', kwargs['group'].message)
+        if event_id is None:
+            event_id = uuid4().hex
+        kwargs.setdefault('data', LEGACY_DATA.copy())
+        if kwargs.get('tags'):
+            tags = kwargs.pop('tags')
+            if isinstance(tags, dict):
+                tags = tags.items()
+            kwargs['data']['tags'] = tags
 
         return Event.objects.create(
             event_id=event_id,
@@ -81,8 +152,9 @@ class Fixtures(object):
         )
 
     def create_group(self, project=None, **kwargs):
+        kwargs.setdefault('message', 'Hello world')
+        kwargs.setdefault('checksum', uuid4().hex)
         return Group.objects.create(
-            message='Foo bar',
             project=project or self.project,
             **kwargs
         )

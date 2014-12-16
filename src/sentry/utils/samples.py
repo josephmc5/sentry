@@ -5,10 +5,12 @@ sentry.utils.samples
 :copyright: (c) 2013 by the Sentry Team, see AUTHORS for more details.
 :license: BSD, see LICENSE for more details.
 """
+from __future__ import absolute_import
+
 import os.path
 
 from sentry.constants import DATA_ROOT, PLATFORM_ROOTS, PLATFORM_TITLES
-from sentry.models import Group
+from sentry.event_manager import EventManager
 from sentry.utils import json
 
 
@@ -42,6 +44,14 @@ def load_data(platform, default=None):
         ('foo', 'bar'),
         ('version', '1.0'),
     ]
+    data['extra'] = {
+        'session': {
+            'foo': 'bar',
+        },
+        'results': [1, 2, 3, 4, 5],
+        'emptyList': [],
+        'emptyMap': {},
+    }
     data['sentry.interfaces.Http'] = {
         "cookies": {},
         "url": "http://example.com/foo",
@@ -72,5 +82,6 @@ def create_sample_event(project, platform=None, default=None):
     if not data:
         return
 
-    data = Group.objects.normalize_event_data(data)
-    return Group.objects.save_data(project.id, data, raw=True)
+    manager = EventManager(data)
+    manager.normalize()
+    return manager.save(project.id, raw=True)

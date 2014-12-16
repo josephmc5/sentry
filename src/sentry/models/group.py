@@ -5,28 +5,96 @@ sentry.models.group
 :copyright: (c) 2010-2014 by the Sentry Team, see AUTHORS for more details.
 :license: BSD, see LICENSE for more details.
 """
+from __future__ import absolute_import, print_function
+
 import logging
 import math
+import six
 import time
 
 from datetime import timedelta
-
 from django.core.urlresolvers import reverse
 from django.db import models
 from django.utils import timezone
 from django.utils.translation import ugettext_lazy as _
 
+from sentry.app import buffer, tsdb
 from sentry.constants import (
     LOG_LEVELS, STATUS_LEVELS, MAX_CULPRIT_LENGTH, STATUS_RESOLVED,
-    STATUS_UNRESOLVED, STATUS_MUTED
+    STATUS_UNRESOLVED, STATUS_MUTED, MAX_TAG_VALUE_LENGTH
 )
 from sentry.db.models import (
-    Model, GzippedDictField, BoundedIntegerField, BoundedPositiveIntegerField,
-    sane_repr
+    BaseManager, BoundedIntegerField, BoundedPositiveIntegerField,
+    Model, GzippedDictField, sane_repr
 )
-from sentry.manager import GroupManager
 from sentry.utils.http import absolute_uri
 from sentry.utils.strings import truncatechars, strip
+
+
+class GroupManager(BaseManager):
+    use_for_related_fields = True
+
+    def get_by_natural_key(self, project, checksum):
+        return self.get(project=project, checksum=checksum)
+
+    def from_kwargs(self, project, **kwargs):
+        from sentry.event_manager import EventManager
+
+        manager = EventManager(kwargs)
+        manager.normalize()
+        return manager.save(project)
+
+    def add_tags(self, group, tags):
+        from sentry.models import TagValue, GroupTagValue
+
+        project = group.project
+        date = group.last_seen
+
+        tsdb_keys = []
+
+        for tag_item in tags:
+            if len(tag_item) == 2:
+                (key, value), data = tag_item, None
+            else:
+                key, value, data = tag_item
+
+            if not value:
+                continue
+
+            value = six.text_type(value)
+            if len(value) > MAX_TAG_VALUE_LENGTH:
+                continue
+
+            tsdb_id = u'%s=%s' % (key, value)
+
+            tsdb_keys.extend([
+                (tsdb.models.project_tag_value, tsdb_id),
+            ])
+
+            buffer.incr(TagValue, {
+                'times_seen': 1,
+            }, {
+                'project': project,
+                'key': key,
+                'value': value,
+            }, {
+                'last_seen': date,
+                'data': data,
+            })
+
+            buffer.incr(GroupTagValue, {
+                'times_seen': 1,
+            }, {
+                'group': group,
+                'project': project,
+                'key': key,
+                'value': value,
+            }, {
+                'last_seen': date,
+            })
+
+        if tsdb_keys:
+            tsdb.incr_multi(tsdb_keys)
 
 
 class Group(Model):
@@ -89,26 +157,9 @@ class Group(Model):
             self.message = self.message.splitlines()[0][:255]
         super(Group, self).save(*args, **kwargs)
 
-    def delete(self):
-        from sentry.models import (
-            GroupTagKey, GroupTagValue, GroupCountByMinute, EventMapping, Event
-        )
-        model_list = (
-            GroupTagKey, GroupTagValue, GroupCountByMinute, EventMapping, Event
-        )
-        for model in model_list:
-            logging.info('Removing %r objects where group=%s', model, self.id)
-            has_results = True
-            while has_results:
-                has_results = False
-                for obj in model.objects.filter(group=self)[:1000]:
-                    obj.delete()
-                    has_results = True
-        super(Group, self).delete()
-
     def get_absolute_url(self):
         return absolute_uri(reverse('sentry-group', args=[
-            self.team.slug, self.project.slug, self.id]))
+            self.organization.slug, self.project.slug, self.id]))
 
     @property
     def avg_time_spent(self):
@@ -117,7 +168,7 @@ class Group(Model):
         return float(self.time_spent_total) / self.time_spent_count
 
     def natural_key(self):
-        return (self.project, self.logger, self.culprit, self.checksum)
+        return (self.project, self.checksum)
 
     def is_over_resolve_age(self):
         resolve_age = self.project.get_option('sentry:resolve_age', None)
@@ -151,29 +202,24 @@ class Group(Model):
                 self._latest_event = None
         return self._latest_event
 
-    def get_version(self):
-        if not self.data:
-            return
-        if 'version' not in self.data:
-            return
-        module = self.data.get('module', 'ver')
-        return module, self.data['version']
-
-    def get_unique_tags(self, tag):
+    def get_unique_tags(self, tag, since=None, order_by='-times_seen'):
+        # TODO(dcramer): this has zero test coverage and is a critical path
         from sentry.models import GroupTagValue
 
-        return GroupTagValue.objects.filter(
+        queryset = GroupTagValue.objects.filter(
             group=self,
-            project=self.project,
             key=tag,
-        ).values_list(
+        )
+        if since:
+            queryset = queryset.filter(last_seen__gte=since)
+        return queryset.values_list(
             'value',
             'times_seen',
             'first_seen',
             'last_seen',
-        ).order_by('-times_seen')
+        ).order_by(order_by)
 
-    def get_tags(self):
+    def get_tags(self, with_internal=True):
         from sentry.models import GroupTagKey
 
         if not hasattr(self, '_tag_cache'):
@@ -182,7 +228,7 @@ class Group(Model):
                     group=self,
                     project=self.project,
                 ).values_list('key', flat=True)
-                if not t.startswith('sentry:')
+                if with_internal or not t.startswith('sentry:')
             ])
         return self._tag_cache
 
@@ -193,9 +239,6 @@ class Group(Model):
     def has_two_part_message(self):
         message = strip(self.message)
         return '\n' in message or len(message) > 100
-
-    def message_top(self):
-        return self.title
 
     @property
     def title(self):
@@ -214,5 +257,17 @@ class Group(Model):
         return message
 
     @property
+    def organization(self):
+        return self.project.organization
+
+    @property
     def team(self):
         return self.project.team
+
+    def get_email_subject(self):
+        return '[%s %s] %s: %s' % (
+            self.team.name.encode('utf-8'),
+            self.project.name.encode('utf-8'),
+            six.text_type(self.get_level_display()).upper().encode('utf-8'),
+            self.message_short.encode('utf-8')
+        )

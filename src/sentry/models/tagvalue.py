@@ -5,6 +5,7 @@ sentry.models.tagvalue
 :copyright: (c) 2010-2014 by the Sentry Team, see AUTHORS for more details.
 :license: BSD, see LICENSE for more details.
 """
+from __future__ import absolute_import, print_function
 
 from django.core.urlresolvers import reverse
 from django.db import models
@@ -62,7 +63,7 @@ class TagValue(Model):
         else:
             url_name = 'sentry-explore-tag-value'
             return absolute_uri(reverse(url_name, args=[
-                self.project.team.slug, self.project.slug, self.key, self.id]))
+                self.project.organization.slug, self.project.slug, self.key, self.id]))
 
         return absolute_uri(reverse(url_name, args=[
-            self.project.team.slug, self.project.slug, self.id]))
+            self.project.organization.slug, self.project.slug, self.id]))

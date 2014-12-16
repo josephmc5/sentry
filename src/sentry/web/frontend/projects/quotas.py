@@ -5,6 +5,8 @@ sentry.web.frontend.projects
 :copyright: (c) 2012 by the Sentry Team, see AUTHORS for more details.
 :license: BSD, see LICENSE for more details.
 """
+from __future__ import absolute_import
+
 from django.contrib import messages
 from django.core.urlresolvers import reverse
 from django.http import HttpResponseRedirect
@@ -18,7 +20,7 @@ from sentry.web.helpers import render_to_response
 
 
 @has_access(MEMBER_OWNER)
-def manage_project_quotas(request, team, project):
+def manage_project_quotas(request, organization, project):
     from sentry.quotas.base import Quota
 
     form = ProjectQuotasForm(project, request.POST or None)
@@ -30,15 +32,16 @@ def manage_project_quotas(request, team, project):
             request, messages.SUCCESS,
             _('Your settings were saved successfully.'))
 
-        return HttpResponseRedirect(reverse('sentry-manage-project-quotas', args=[project.team.slug, project.slug]))
+        return HttpResponseRedirect(reverse('sentry-manage-project-quotas', args=[project.organization.slug, project.slug]))
 
     context = {
-        'team': team,
+        'organization': organization,
+        'team': project.team,
         'page': 'quotas',
         # TODO(dcramer): has_quotas is an awful hack
         'has_quotas': type(app.quotas) != Quota,
-        'system_quota': app.quotas.get_system_quota(),
-        'team_quota': app.quotas.get_team_quota(team),
+        'system_quota': int(app.quotas.get_system_quota()),
+        'team_quota': int(app.quotas.get_team_quota(project.team)),
         'project': project,
         'form': form,
     }

@@ -1,3 +1,5 @@
+from __future__ import absolute_import
+
 from django.conf import settings
 from django.contrib import admin, messages
 from django.contrib.auth.forms import (
@@ -14,34 +16,101 @@ from django.views.decorators.debug import sensitive_post_parameters
 from django.shortcuts import get_object_or_404
 from django.template.response import TemplateResponse
 from django.utils.translation import ugettext, ugettext_lazy as _
-from sentry.models import Project, Team, User
+
+from sentry.models import (
+    Broadcast, Organization, OrganizationMember, Project, Team, User
+)
 
 csrf_protect_m = method_decorator(csrf_protect)
 sensitive_post_parameters_m = method_decorator(sensitive_post_parameters())
 
 
+class BroadcastAdmin(admin.ModelAdmin):
+    list_display = ('message', 'is_active', 'date_added')
+    list_filter = ('is_active',)
+    search_fields = ('message', 'url')
+
+admin.site.register(Broadcast, BroadcastAdmin)
+
+
 class ProjectAdmin(admin.ModelAdmin):
-    list_display = ('full_slug', 'owner', 'platform', 'date_added')
+    list_display = ('full_slug', 'platform', 'status', 'date_added')
     list_filter = ('status', 'platform', 'public')
-    search_fields = ('name', 'owner__username', 'owner__email', 'team__slug',
+    search_fields = ('name', 'team__owner__username', 'team__owner__email', 'team__slug',
                      'team__name', 'slug')
-    raw_id_fields = ('owner', 'team')
+    raw_id_fields = ('team', 'organization')
 
     def full_slug(self, instance):
         if not instance.team:
             slug = instance.slug
         else:
-            slug = '%s/%s' % (instance.team.slug, instance.slug)
+            slug = '%s/%s' % (instance.organization.slug, instance.slug)
         return mark_safe('%s<br><small>%s</small>' % (
             escape(slug), escape(instance.name)))
 
 admin.site.register(Project, ProjectAdmin)
 
 
-class TeamAdmin(admin.ModelAdmin):
-    list_display = ('name', 'owner', 'slug')
-    search_fields = ('name', 'owner__username', 'owner__email', 'slug')
+class OrganizationTeamInline(admin.TabularInline):
+    model = Team
+    extra = 1
+    fields = ('name', 'slug', 'owner', 'status', 'date_added')
+    raw_id_fields = ('organization', 'owner')
+
+
+class OrganizationMemberInline(admin.TabularInline):
+    model = OrganizationMember
+    extra = 1
+    fields = ('user', 'type', 'organization')
+    raw_id_fields = ('user', 'organization')
+
+
+class OrganizationAdmin(admin.ModelAdmin):
+    list_display = ('name', 'owner', 'status')
+    list_filter = ('status',)
+    search_fields = ('name', 'owner__username', 'owner__email')
     raw_id_fields = ('owner',)
+    inlines = (OrganizationMemberInline, OrganizationTeamInline)
+
+admin.site.register(Organization, OrganizationAdmin)
+
+
+class TeamProjectInline(admin.TabularInline):
+    model = Project
+    extra = 1
+    fields = ('name', 'slug')
+    raw_id_fields = ('organization', 'team')
+
+
+class TeamAdmin(admin.ModelAdmin):
+    list_display = ('name', 'slug', 'status', 'date_added')
+    list_filter = ('status',)
+    search_fields = ('name', 'organization__name', 'slug')
+    raw_id_fields = ('owner', 'organization')
+    inlines = (TeamProjectInline,)
+
+    def save_model(self, request, obj, form, change):
+        # TODO(dcramer): remove when ownership is irrelevant
+        if change:
+            obj.owner = obj.organization.owner
+        super(TeamAdmin, self).save_model(request, obj, form, change)
+        if not change:
+            return
+
+        Project.objects.filter(
+            team=obj,
+        ).update(
+            organization=obj.organization,
+        )
+
+        # remove invalid team links
+        queryset = OrganizationMember.objects.filter(
+            teams=obj,
+        ).exclude(
+            organization=obj.organization,
+        )
+        for member in queryset:
+            member.teams.remove(obj)
 
 admin.site.register(Team, TeamAdmin)
 
@@ -65,9 +134,10 @@ class UserAdmin(admin.ModelAdmin):
     add_form = UserCreationForm
     change_password_form = AdminPasswordChangeForm
     list_display = ('username', 'email', 'first_name', 'last_name', 'is_staff')
-    list_filter = ('is_staff', 'is_superuser', 'is_active')
+    list_filter = ('is_staff', 'is_superuser', 'is_active', 'is_managed')
     search_fields = ('username', 'first_name', 'last_name', 'email')
     ordering = ('username',)
+    inlines = (OrganizationMemberInline,)
 
     def get_fieldsets(self, request, obj=None):
         if not obj:
