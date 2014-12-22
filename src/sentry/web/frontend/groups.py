@@ -13,9 +13,12 @@ from __future__ import absolute_import, division
 
 import datetime
 import re
+import logging
 
 from django.core.urlresolvers import reverse
-from django.http import HttpResponse, HttpResponseRedirect, Http404
+from django.http import (
+    HttpResponse, HttpResponsePermanentRedirect, HttpResponseRedirect, Http404
+)
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 
@@ -31,7 +34,9 @@ from sentry.permissions import (
     can_admin_group, can_remove_group, can_create_projects
 )
 from sentry.plugins import plugins
+from sentry.search.utils import parse_query
 from sentry.utils import json
+from sentry.utils.cursors import Cursor
 from sentry.utils.dates import parse_date
 from sentry.web.decorators import has_access, has_group_access, login_required
 from sentry.web.forms import NewNoteForm
@@ -46,16 +51,15 @@ def _get_group_list(request, project):
         'project': project,
     }
 
-    query = request.GET.get('query')
-    if query:
-        query_kwargs['query'] = query
-
     status = request.GET.get('status', '0')
     if status:
         query_kwargs['status'] = int(status)
 
     if request.user.is_authenticated() and request.GET.get('bookmarks'):
         query_kwargs['bookmarked_by'] = request.user
+
+    if request.user.is_authenticated() and request.GET.get('assigned'):
+        query_kwargs['assigned_to'] = request.user
 
     sort_by = request.GET.get('sort') or request.session.get('streamsort')
     if sort_by is None:
@@ -71,8 +75,11 @@ def _get_group_list(request, project):
     for tag_key in TagKey.objects.all_keys(project):
         if request.GET.get(tag_key):
             tags[tag_key] = request.GET[tag_key]
+
     if tags:
         query_kwargs['tags'] = tags
+    else:
+        query_kwargs['tags'] = {}
 
     date_from = request.GET.get('df')
     time_from = request.GET.get('tf')
@@ -93,27 +100,26 @@ def _get_group_list(request, project):
     if date_filter:
         query_kwargs['date_filter'] = date_filter
 
-    # HACK(dcramer): this should be removed once the pagination component
-    # is abstracted from the paginator tag
-    try:
-        page = int(request.GET.get('p', 1))
-    except (ValueError, TypeError):
-        page = 1
+    cursor = request.GET.get('cursor')
+    if cursor:
+        try:
+            query_kwargs['cursor'] = Cursor.from_string(cursor)
+        except ValueError:
+            # XXX(dcramer): ideally we'd error, but this is an internal API so
+            # we'd rather just throw it away
+            logging.info('Throwing away invalid cursor: %s', cursor)
+    query_kwargs['limit'] = EVENTS_PER_PAGE
 
-    query_kwargs['offset'] = (page - 1) * EVENTS_PER_PAGE
-    query_kwargs['limit'] = EVENTS_PER_PAGE + 1
+    query = request.GET.get('query', '')
+    if query is not None:
+        query_result = parse_query(query, request.user)
+        # Disclaimer: the following code is disgusting
+        if query_result.get('query'):
+            query_kwargs['query'] = query_result['query']
+        if query_result.get('tags'):
+            query_kwargs['tags'].update(query_result['tags'])
 
     results = app.search.query(**query_kwargs)
-
-    if len(results) == query_kwargs['limit']:
-        next_page = page + 1
-    else:
-        next_page = None
-
-    if page > 1:
-        prev_page = page - 1
-    else:
-        prev_page = None
 
     return {
         'event_list': results[:EVENTS_PER_PAGE],
@@ -122,8 +128,8 @@ def _get_group_list(request, project):
         'today': today,
         'sort': sort_by,
         'date_type': date_filter,
-        'previous_page': prev_page,
-        'next_page': next_page,
+        'next_cursor': results.next,
+        'prev_cursor': results.prev,
     }
 
 
@@ -222,12 +228,7 @@ def wall_display(request, organization, team):
 @login_required
 @has_access
 def group_list(request, organization, project):
-    try:
-        page = int(request.GET.get('p', 1))
-    except (TypeError, ValueError):
-        page = 1
-
-    query = request.GET.get('query')
+    query = request.GET.get('query', 'is:unresolved')
     if query and uuid_re.match(query):
         # Forward to event if it exists
         try:
@@ -253,12 +254,12 @@ def group_list(request, organization, project):
     # XXX: this is duplicate in _get_group_list
     sort_label = SORT_OPTIONS[response['sort']]
 
-    has_realtime = page == 1
+    has_realtime = not request.GET.get('cursor')
 
     query_dict = request.GET.copy()
-    if 'p' in query_dict:
-        del query_dict['p']
-    pageless_query_string = query_dict.urlencode()
+    if 'cursor' in query_dict:
+        del query_dict['cursor']
+    cursorless_query_string = query_dict.urlencode()
 
     GroupMeta.objects.populate_cache(response['event_list'])
 
@@ -271,18 +272,55 @@ def group_list(request, organization, project):
         'date_type': response['date_type'],
         'has_realtime': has_realtime,
         'event_list': response['event_list'],
-        'previous_page': response['previous_page'],
-        'next_page': response['next_page'],
+        'prev_cursor': response['prev_cursor'],
+        'next_cursor': response['next_cursor'],
         'today': response['today'],
         'sort': response['sort'],
-        'pageless_query_string': pageless_query_string,
+        'query': query,
+        'cursorless_query_string': cursorless_query_string,
         'sort_label': sort_label,
         'SORT_OPTIONS': SORT_OPTIONS,
     }, request)
 
 
+def group(request, organization_slug, project_id, group_id, event_id=None):
+    # TODO(dcramer): remove in 7.1 release
+    # Handle redirects from team_slug/project_slug to org_slug/project_slug
+    try:
+        group = Group.objects.get(id=group_id)
+    except Group.DoesNotExist:
+        raise Http404
+
+    if group.project.slug != project_id:
+        raise Http404
+
+    if group.organization.slug == organization_slug:
+        return group_details(
+            request=request,
+            organization_slug=organization_slug,
+            project_id=project_id,
+            group_id=group_id,
+            event_id=event_id,
+        )
+
+    if group.team.slug == organization_slug:
+        if event_id:
+            url = reverse(
+                'sentry-group-event',
+                args=[group.organization.slug, project_id, group_id, event_id],
+            )
+        else:
+            url = reverse(
+                'sentry-group',
+                args=[group.organization.slug, project_id, group_id],
+            )
+        return HttpResponsePermanentRedirect(url)
+
+    raise Http404
+
+
 @has_group_access(allow_public=True)
-def group(request, organization, project, group, event_id=None):
+def group_details(request, organization, project, group, event_id=None):
     # It's possible that a message would not be created under certain
     # circumstances (such as a post_save signal failing)
     if event_id:

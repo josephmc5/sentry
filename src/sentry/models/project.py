@@ -16,9 +16,7 @@ from django.db.models import F, Q
 from django.utils import timezone
 from django.utils.translation import ugettext_lazy as _
 
-from sentry.constants import (
-    PLATFORM_TITLES, PLATFORM_LIST, STATUS_VISIBLE, STATUS_HIDDEN
-)
+from sentry.constants import PLATFORM_TITLES, PLATFORM_LIST
 from sentry.db.models import (
     BaseManager, BoundedPositiveIntegerField, Model, sane_repr
 )
@@ -53,9 +51,13 @@ class ProjectManager(BaseManager):
             base_qs = Project.objects.filter(
                 accessgroup__team=team,
                 accessgroup__members=user,
+                status=ProjectStatus.VISIBLE,
             )
         else:
-            base_qs = self.filter(team=team)
+            base_qs = self.filter(
+                team=team,
+                status=ProjectStatus.VISIBLE,
+            )
 
         project_list = []
         for project in base_qs:
@@ -63,6 +65,13 @@ class ProjectManager(BaseManager):
             project_list.append(project)
 
         return sorted(project_list, key=lambda x: x.name.lower())
+
+
+# TODO(dcramer): pull in enum library
+class ProjectStatus(object):
+    VISIBLE = 0
+    PENDING_DELETION = 1
+    DELETION_IN_PROGRESS = 2
 
 
 class Project(Model):
@@ -82,8 +91,9 @@ class Project(Model):
     public = models.BooleanField(default=False)
     date_added = models.DateTimeField(default=timezone.now)
     status = BoundedPositiveIntegerField(default=0, choices=(
-        (STATUS_VISIBLE, _('Active')),
-        (STATUS_HIDDEN, _('Hidden')),
+        (ProjectStatus.VISIBLE, _('Active')),
+        (ProjectStatus.PENDING_DELETION, _('Pending Deletion')),
+        (ProjectStatus.DELETION_IN_PROGRESS, _('Deletion in Progress')),
     ), db_index=True)
     platform = models.CharField(max_length=32, choices=PLATFORM_CHOICES, null=True)
 

@@ -32,7 +32,7 @@ import six
 from six.moves import range
 
 from sentry import options
-from sentry.constants import STATUS_MUTED, EVENTS_PER_PAGE
+from sentry.constants import EVENTS_PER_PAGE
 from sentry.models import Organization
 from sentry.web.helpers import group_is_public
 from sentry.utils import to_unicode
@@ -370,11 +370,6 @@ def titlize(value):
 
 
 @register.filter
-def is_muted(value):
-    return value == STATUS_MUTED
-
-
-@register.filter
 def split(value, delim=''):
     return value.split(delim)
 
@@ -439,15 +434,6 @@ def render_values(value, threshold=5, collapse_to=3):
     return context
 
 
-@register.inclusion_tag('sentry/partial/_client_config.html')
-def client_help(user, project):
-    from sentry.web.frontend.docs import get_key_context
-
-    context = get_key_context(user, project)
-    context['project'] = project
-    return context
-
-
 @tag(register, [Constant('from'), Variable('project'),
                 Constant('as'), Name('asvar')])
 def recent_alerts(context, project, asvar):
@@ -494,10 +480,15 @@ def list_organizations(user):
 def needs_access_group_migration(user, organization):
     from sentry.models import AccessGroup, OrganizationMember, OrganizationMemberType
 
-    return OrganizationMember.objects.filter(
+    has_org_access_queryset = OrganizationMember.objects.filter(
         user=user,
         organization=organization,
-        type=OrganizationMemberType.ADMIN,
-    ).exists() and AccessGroup.objects.filter(
+        type__lte=OrganizationMemberType.ADMIN,
+    )
+
+    if not (user.is_superuser or has_org_access_queryset.exists()):
+        return False
+
+    return AccessGroup.objects.filter(
         team__organization=organization
     ).exists()

@@ -8,6 +8,7 @@ sentry.event_manager
 from __future__ import absolute_import, print_function
 
 import logging
+import math
 import six
 
 from datetime import datetime, timedelta
@@ -20,9 +21,11 @@ from uuid import uuid4
 
 from sentry.app import buffer, tsdb
 from sentry.constants import (
-    STATUS_UNRESOLVED, LOG_LEVELS, DEFAULT_LOGGER_NAME, MAX_CULPRIT_LENGTH
+    LOG_LEVELS, DEFAULT_LOGGER_NAME, MAX_CULPRIT_LENGTH
 )
-from sentry.models import Event, EventMapping, Group, GroupHash, Project
+from sentry.models import (
+    Event, EventMapping, Group, GroupHash, GroupStatus, Project
+)
 from sentry.plugins import plugins
 from sentry.signals import regression_signal
 from sentry.utils.logging import suppress_exceptions
@@ -118,6 +121,10 @@ class ScoreClause(object):
             sql = int(self)
 
         return (sql, [])
+
+    @classmethod
+    def calculate(self, times_seen, last_seen):
+        return math.log(times_seen) * 600 + float(last_seen.strftime('%s'))
 
 
 class EventManager(object):
@@ -216,7 +223,7 @@ class EventManager(object):
         return data
 
     @suppress_exceptions
-    @transaction.commit_on_success
+    @transaction.atomic
     def save(self, project, raw=False):
         # TODO: culprit should default to "most recent" frame in stacktraces when
         # it's not provided.
@@ -310,23 +317,18 @@ class EventManager(object):
 
         # save the event unless its been sampled
         if not is_sample:
-            sid = transaction.savepoint(using=using)
             try:
-                event.save()
+                with transaction.atomic():
+                    event.save()
             except IntegrityError:
-                transaction.savepoint_rollback(sid, using=using)
                 return event
-            transaction.savepoint_commit(sid, using=using)
 
-        sid = transaction.savepoint(using=using)
         try:
-            EventMapping.objects.create(
-                project=project, group=group, event_id=event_id)
+            with transaction.atomic():
+                EventMapping.objects.create(
+                    project=project, group=group, event_id=event_id)
         except IntegrityError:
-            transaction.savepoint_rollback(sid, using=using)
             return event
-        transaction.savepoint_commit(sid, using=using)
-        transaction.commit_unless_managed(using=using)
 
         if not raw:
             post_process_group.delay(
@@ -396,6 +398,7 @@ class EventManager(object):
         # it should be resolved by the hash merging function later but this
         # should be better tested/reviewed
         if existing_group_id is None:
+            kwargs['score'] = ScoreClause.calculate(1, kwargs['last_seen'])
             group, group_is_new = Group.objects.get_or_create(
                 project=project,
                 # TODO(dcramer): remove checksum from Group/Event
@@ -438,13 +441,6 @@ class EventManager(object):
         else:
             is_regression = False
 
-            # TODO: this update should actually happen as part of create
-            group.update(score=ScoreClause(group))
-
-            # We need to commit because the queue can run too fast and hit
-            # an issue with the group not existing before the buffers run
-            transaction.commit_unless_managed(using=group._state.db)
-
         # Determine if we've sampled enough data to store this event
         if is_new:
             is_sample = False
@@ -452,6 +448,10 @@ class EventManager(object):
             is_sample = False
         else:
             is_sample = True
+
+        # We need to commit because the queue can run too fast and hit
+        # an issue with the group not existing before the buffers run
+        transaction.commit(using=group._state.db)
 
         # Rounded down to the nearest interval
         safe_execute(Group.objects.add_tags, group, tags)
@@ -484,12 +484,12 @@ class EventManager(object):
                 # add 30 seconds to the regression window to account for
                 # races here
                 active_at__gte=date - timedelta(seconds=5),
-            ).update(active_at=date, status=STATUS_UNRESOLVED))
+            ).update(active_at=date, status=GroupStatus.UNRESOLVED))
 
-            transaction.commit_unless_managed(using=group._state.db)
+            transaction.commit(using=group._state.db)
 
             group.active_at = date
-            group.status = STATUS_UNRESOLVED
+            group.status = GroupStatus.UNRESOLVED
 
         group.last_seen = extra['last_seen']
 

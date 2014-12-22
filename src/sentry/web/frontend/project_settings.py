@@ -13,7 +13,7 @@ from sentry.models import (
 )
 from sentry.permissions import can_remove_project, can_set_public_projects
 from sentry.plugins import plugins
-from sentry.web.forms.fields import RangeField
+from sentry.web.forms.fields import CustomTypedChoiceField, RangeField
 from sentry.web.frontend.base import ProjectView
 
 
@@ -69,11 +69,16 @@ class EditProjectForm(forms.ModelForm):
         widget=forms.Select(attrs={'data-placeholder': _('Select a platform')}))
     public = forms.BooleanField(required=False,
         help_text=_('Imply public access to any event for this project.'))
-    team = forms.TypedChoiceField(choices=(), coerce=int, required=False)
+    team = CustomTypedChoiceField(choices=(), coerce=int, required=False)
     origins = OriginsField(label=_('Allowed Domains'), required=False,
         help_text=_('Separate multiple entries with a newline.'))
     resolve_age = RangeField(help_text=_('Treat an event as resolved if it hasn\'t been seen for this amount of time.'),
         required=False, min_value=0, max_value=168, step_value=1)
+    scrub_data = forms.BooleanField(
+        label=_('Data Scrubber'),
+        help_text=_('Apply server-side data scrubbing to prevent things like passwords and credit cards from being stored.'),
+        required=False
+    )
 
     class Meta:
         fields = ('name', 'platform', 'public', 'team', 'slug')
@@ -86,11 +91,8 @@ class EditProjectForm(forms.ModelForm):
 
         if not can_set_public_projects(request.user):
             del self.fields['public']
-        if len(team_list) == 1 and instance.team == team_list[0]:
-            del self.fields['team']
-        else:
-            self.fields['team'].choices = self.get_team_choices(team_list, instance.team)
-            self.fields['team'].widget.choices = self.fields['team'].choices
+        self.fields['team'].choices = self.get_team_choices(team_list, instance.team)
+        self.fields['team'].widget.choices = self.fields['team'].choices
 
     def get_team_label(self, team):
         return '%s (%s)' % (team.name, team.slug)
@@ -171,6 +173,7 @@ class ProjectSettingsView(ProjectView):
         return EditProjectForm(request, team_list, request.POST or None, instance=project, initial={
             'origins': '\n'.join(project.get_option('sentry:origins', None) or []),
             'resolve_age': int(project.get_option('sentry:resolve_age', 0)),
+            'scrub_data': bool(project.get_option('sentry:scrub_data', True)),
         })
 
     def handle(self, request, organization, team, project):
@@ -178,8 +181,12 @@ class ProjectSettingsView(ProjectView):
 
         if form.is_valid():
             project = form.save()
-            project.update_option('sentry:origins', form.cleaned_data.get('origins') or [])
-            project.update_option('sentry:resolve_age', form.cleaned_data.get('resolve_age'))
+            for opt in ('origins', 'resolve_age', 'scrub_data'):
+                value = form.cleaned_data.get(opt)
+                if value is None:
+                    project.delete_option('sentry:%s' % (opt,))
+                else:
+                    project.update_option('sentry:%s' % (opt,), value)
 
             AuditLogEntry.objects.create(
                 organization=organization,

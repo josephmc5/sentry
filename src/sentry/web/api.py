@@ -22,6 +22,7 @@ from django.http import (
     HttpResponseForbidden, HttpResponseRedirect,
 )
 from django.utils import timezone
+from django.utils.http import urlquote
 from django.utils.translation import ugettext as _
 from django.views.decorators.cache import never_cache, cache_control
 from django.views.decorators.csrf import csrf_exempt
@@ -30,10 +31,9 @@ from functools import wraps
 from raven.contrib.django.models import client as Raven
 
 from sentry import app
+from sentry.api.base import LINK_HEADER
 from sentry.app import tsdb
-from sentry.constants import (
-    MEMBER_USER, STATUS_MUTED, STATUS_UNRESOLVED, STATUS_RESOLVED,
-    EVENTS_PER_PAGE)
+from sentry.constants import MEMBER_USER, EVENTS_PER_PAGE
 from sentry.coreapi import (
     project_from_auth_vars, decode_and_decompress_data,
     safely_load_json_string, validate_data, insert_data_to_database, APIError,
@@ -42,7 +42,9 @@ from sentry.coreapi import (
 from sentry.exceptions import InvalidData, InvalidOrigin, InvalidRequest
 from sentry.event_manager import EventManager
 from sentry.models import (
-    Group, GroupBookmark, GroupTagValue, Project, TagValue, Activity, User)
+    Group, GroupBookmark, GroupStatus, GroupTagValue, Project, TagValue,
+    Activity, User
+)
 from sentry.signals import event_received
 from sentry.plugins import plugins
 from sentry.quotas.base import RateLimit
@@ -369,9 +371,10 @@ class StoreView(APIView):
             logger.warning('Discarded recent duplicate event from project %s/%s (id=%s)', project.organization.slug, project.slug, event_id)
             raise InvalidRequest('An event with the same ID already exists.')
 
-        # We filter data immediately before it ever gets into the queue
-        inst = SensitiveDataFilter()
-        inst.apply(data)
+        if project.get_option('sentry:scrub_data', True):
+            # We filter data immediately before it ever gets into the queue
+            inst = SensitiveDataFilter()
+            inst.apply(data)
 
         # mutates data (strips a lot of context if not queued)
         insert_data_to_database(data)
@@ -386,20 +389,53 @@ class StoreView(APIView):
 @csrf_exempt
 @has_access
 @never_cache
-@api
 def poll(request, organization, project):
     offset = 0
     limit = EVENTS_PER_PAGE
 
-    response = _get_group_list(
+    group_result = _get_group_list(
         request=request,
         project=project,
     )
 
-    event_list = response['event_list']
+    event_list = group_result['event_list']
     event_list = list(event_list[offset:limit])
 
-    return to_json(event_list, request)
+    data = to_json(event_list, request)
+
+    links = [
+        ('previous', str(group_result['prev_cursor'])),
+        ('next', str(group_result['next_cursor'])),
+    ]
+
+    querystring = u'&'.join(
+        u'{0}={1}'.format(urlquote(k), urlquote(v))
+        for k, v in request.GET.iteritems()
+        if k != 'cursor'
+    )
+    base_url = request.build_absolute_uri(request.path)
+    if querystring:
+        base_url = '{0}?{1}'.format(base_url, querystring)
+    else:
+        base_url = base_url + '?'
+
+    link_values = []
+    for name, cursor in links:
+        link_values.append(LINK_HEADER.format(
+            uri=base_url,
+            cursor=cursor,
+            name=name,
+        ))
+
+    headers = {}
+    if link_values:
+        headers['Link'] = ', '.join(link_values)
+
+    response = HttpResponse(data)
+    response['Content-Type'] = 'application/json'
+    if link_values:
+        response['Link'] = ', '.join(link_values)
+    return response
 
 
 @csrf_exempt
@@ -420,11 +456,11 @@ def resolve(request, organization, project):
 
     happened = Group.objects.filter(
         pk=group.pk,
-    ).exclude(status=STATUS_RESOLVED).update(
-        status=STATUS_RESOLVED,
+    ).exclude(status=GroupStatus.RESOLVED).update(
+        status=GroupStatus.RESOLVED,
         resolved_at=now,
     )
-    group.status = STATUS_RESOLVED
+    group.status = GroupStatus.RESOLVED
     group.resolved_at = now
 
     if happened:
@@ -495,7 +531,7 @@ def resolve_group(request, organization, project, group_id):
         return HttpResponseForbidden()
 
     happened = group.update(
-        status=STATUS_RESOLVED,
+        status=GroupStatus.RESOLVED,
         resolved_at=timezone.now(),
     )
     if happened:
@@ -520,7 +556,7 @@ def mute_group(request, organization, project, group_id):
         return HttpResponseForbidden()
 
     happened = group.update(
-        status=STATUS_MUTED,
+        status=GroupStatus.MUTED,
         resolved_at=timezone.now(),
     )
     if happened:
@@ -545,7 +581,7 @@ def unresolve_group(request, organization, project, group_id):
         return HttpResponseForbidden()
 
     happened = group.update(
-        status=STATUS_UNRESOLVED,
+        status=GroupStatus.UNRESOLVED,
         active_at=timezone.now(),
     )
     if happened:
@@ -661,9 +697,9 @@ def bookmark(request, organization, project):
 def clear(request, organization, project):
     queryset = Group.objects.filter(
         project=project,
-        status=STATUS_UNRESOLVED,
+        status=GroupStatus.UNRESOLVED,
     )
-    rows_affected = queryset.update(status=STATUS_RESOLVED)
+    rows_affected = queryset.update(status=GroupStatus.RESOLVED)
     if rows_affected > 1000:
         logger.warning(
             'Large resolve on %s of %s rows', project.slug, rows_affected)
@@ -701,7 +737,7 @@ def get_group_trends(request, organization, team):
     cutoff_dt = timezone.now() - cutoff
 
     group_list = list(base_qs.filter(
-        status=STATUS_UNRESOLVED,
+        status=GroupStatus.UNRESOLVED,
         last_seen__gte=cutoff_dt
     ).extra(select={'sort_value': 'score'}).order_by('-score')[:limit])
 
@@ -732,7 +768,7 @@ def get_new_groups(request, organization, team):
 
     group_list = list(Group.objects.filter(
         project__in=project_dict.keys(),
-        status=STATUS_UNRESOLVED,
+        status=GroupStatus.UNRESOLVED,
         active_at__gte=cutoff_dt,
     ).extra(select={'sort_value': 'score'}).order_by('-score', '-first_seen')[:limit])
 
@@ -763,7 +799,7 @@ def get_resolved_groups(request, organization, team):
 
     group_list = list(Group.objects.filter(
         project__in=project_list,
-        status=STATUS_RESOLVED,
+        status=GroupStatus.RESOLVED,
         resolved_at__gte=cutoff_dt,
     ).order_by('-score')[:limit])
 
@@ -781,15 +817,10 @@ def get_resolved_groups(request, organization, team):
 @never_cache
 @csrf_exempt
 @has_access
-def get_stats(request, organization, team=None, project=None):
+def get_stats(request, organization, team):
     minutes = int(request.REQUEST.get('minutes', 15))
 
-    if not team and project:
-        project_list = [project]
-    elif team:
-        project_list = Project.objects.get_for_user(team=team, user=request.user)
-    else:
-        return HttpResponse(status=400)
+    project_list = Project.objects.get_for_user(team=team, user=request.user)
 
     cutoff = timedelta(minutes=minutes)
 
@@ -812,7 +843,7 @@ def get_stats(request, organization, team=None, project=None):
     # TODO(dcramer); move this into tsdb
     num_resolved = Group.objects.filter(
         project__in=project_list,
-        status=STATUS_RESOLVED,
+        status=GroupStatus.RESOLVED,
         resolved_at__gte=start,
     ).aggregate(t=Sum('times_seen'))['t'] or 0
 

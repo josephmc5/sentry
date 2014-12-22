@@ -9,7 +9,6 @@ from django.utils.translation import ugettext_lazy as _
 from sentry.models import (
     AuditLogEntry, AuditLogEntryEvent, OrganizationMemberType, TeamStatus
 )
-from sentry.permissions import can_remove_team
 from sentry.tasks.deletion import delete_team
 from sentry.web.frontend.base import TeamView
 
@@ -28,13 +27,10 @@ class RemoveTeamView(TeamView):
         return RemoveTeamForm(None)
 
     def handle(self, request, organization, team):
-        if not can_remove_team(request.user, team):
-            return HttpResponseRedirect(reverse('sentry'))
-
         form = self.get_form(request)
 
         if form.is_valid():
-            if team.status != TeamStatus.PENDING_DELETION:
+            if team.status == TeamStatus.VISIBLE:
                 team.update(status=TeamStatus.PENDING_DELETION)
                 delete_team.delay(object_id=team.id, countdown=60 * 5)
 

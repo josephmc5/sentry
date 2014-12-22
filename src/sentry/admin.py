@@ -8,7 +8,6 @@ from django.contrib.auth.forms import (
 from django.core.exceptions import PermissionDenied
 from django.db import transaction
 from django.http import Http404, HttpResponseRedirect
-from django.utils.safestring import mark_safe
 from django.utils.html import escape
 from django.utils.decorators import method_decorator
 from django.views.decorators.csrf import csrf_protect
@@ -18,7 +17,8 @@ from django.template.response import TemplateResponse
 from django.utils.translation import ugettext, ugettext_lazy as _
 
 from sentry.models import (
-    Broadcast, Organization, OrganizationMember, Project, Team, User
+    AuditLogEntry, Broadcast, HelpPage, Organization, OrganizationMember,
+    Project, Team, User
 )
 
 csrf_protect_m = method_decorator(csrf_protect)
@@ -34,19 +34,11 @@ admin.site.register(Broadcast, BroadcastAdmin)
 
 
 class ProjectAdmin(admin.ModelAdmin):
-    list_display = ('full_slug', 'platform', 'status', 'date_added')
+    list_display = ('name', 'slug', 'organization', 'platform', 'status', 'date_added')
     list_filter = ('status', 'platform', 'public')
     search_fields = ('name', 'team__owner__username', 'team__owner__email', 'team__slug',
                      'team__name', 'slug')
     raw_id_fields = ('team', 'organization')
-
-    def full_slug(self, instance):
-        if not instance.team:
-            slug = instance.slug
-        else:
-            slug = '%s/%s' % (instance.organization.slug, instance.slug)
-        return mark_safe('%s<br><small>%s</small>' % (
-            escape(slug), escape(instance.name)))
 
 admin.site.register(Project, ProjectAdmin)
 
@@ -66,9 +58,9 @@ class OrganizationMemberInline(admin.TabularInline):
 
 
 class OrganizationAdmin(admin.ModelAdmin):
-    list_display = ('name', 'owner', 'status')
+    list_display = ('name', 'slug', 'owner', 'status')
     list_filter = ('status',)
-    search_fields = ('name', 'owner__username', 'owner__email')
+    search_fields = ('name', 'owner__username', 'owner__email', 'slug')
     raw_id_fields = ('owner',)
     inlines = (OrganizationMemberInline, OrganizationTeamInline)
 
@@ -83,7 +75,7 @@ class TeamProjectInline(admin.TabularInline):
 
 
 class TeamAdmin(admin.ModelAdmin):
-    list_display = ('name', 'slug', 'status', 'date_added')
+    list_display = ('name', 'slug', 'organization', 'status', 'date_added')
     list_filter = ('status',)
     search_fields = ('name', 'organization__name', 'slug')
     raw_id_fields = ('owner', 'organization')
@@ -172,7 +164,7 @@ class UserAdmin(admin.ModelAdmin):
 
     @sensitive_post_parameters_m
     @csrf_protect_m
-    @transaction.commit_on_success
+    @transaction.atomic
     def add_view(self, request, form_url='', extra_context=None):
         # It's an error for a user to have add permission but NOT change
         # permission for users. If we allowed such users to add users, they
@@ -257,3 +249,20 @@ class UserAdmin(admin.ModelAdmin):
                                                    post_url_continue)
 
 admin.site.register(User, UserAdmin)
+
+
+class AuditLogEntryAdmin(admin.ModelAdmin):
+    list_display = ('event', 'organization', 'actor', 'datetime')
+    list_filter = ('event', 'datetime')
+    search_fields = ('actor__email', 'organization__name', 'organization__slug', 'get_note')
+    raw_id_fields = ('organization', 'actor', 'target_user')
+
+admin.site.register(AuditLogEntry, AuditLogEntryAdmin)
+
+
+class HelpPageAdmin(admin.ModelAdmin):
+    list_display = ('title', 'is_visible', 'priority')
+    list_filter = ('is_visible',)
+    search_fields = ('title', 'content')
+
+admin.site.register(HelpPage, HelpPageAdmin)
