@@ -89,7 +89,7 @@ else:
 def plugin_is_regression(group, event):
     project = event.project
     for plugin in plugins.for_project(project):
-        result = safe_execute(plugin.is_regression, group, event)
+        result = safe_execute(plugin.is_regression, group, event, _with_transaction=False)
         if result is not None:
             return result
     return True
@@ -223,7 +223,6 @@ class EventManager(object):
         return data
 
     @suppress_exceptions
-    @transaction.atomic
     def save(self, project, raw=False):
         # TODO: culprit should default to "most recent" frame in stacktraces when
         # it's not provided.
@@ -314,6 +313,9 @@ class EventManager(object):
         using = group._state.db
 
         event.group = group
+
+        # Rounded down to the nearest interval
+        safe_execute(Group.objects.add_tags, group, tags)
 
         # save the event unless its been sampled
         if not is_sample:
@@ -449,13 +451,6 @@ class EventManager(object):
         else:
             is_sample = True
 
-        # We need to commit because the queue can run too fast and hit
-        # an issue with the group not existing before the buffers run
-        transaction.commit(using=group._state.db)
-
-        # Rounded down to the nearest interval
-        safe_execute(Group.objects.add_tags, group, tags)
-
         tsdb.incr_multi([
             (tsdb.models.group, group.id),
             (tsdb.models.project, project.id),
@@ -480,13 +475,13 @@ class EventManager(object):
         if group.is_resolved() and plugin_is_regression(group, event):
             is_regression = bool(Group.objects.filter(
                 id=group.id,
+                # ensure we cant update things if the status has been set to
+                # muted
+                status__in=[GroupStatus.RESOLVED, GroupStatus.UNRESOLVED],
             ).exclude(
-                # add 30 seconds to the regression window to account for
-                # races here
+                # add to the regression window to account for races here
                 active_at__gte=date - timedelta(seconds=5),
             ).update(active_at=date, status=GroupStatus.UNRESOLVED))
-
-            transaction.commit(using=group._state.db)
 
             group.active_at = date
             group.status = GroupStatus.UNRESOLVED
