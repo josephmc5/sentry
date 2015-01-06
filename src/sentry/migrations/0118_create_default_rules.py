@@ -10,9 +10,10 @@ class Migration(DataMigration):
         from sentry.receivers.rules import create_default_rules
 
         Project = orm['sentry.Project']
+        Rule = orm['sentry.Rule']
 
         for project in Project.objects.all():
-            create_default_rules(instance=project, created=True)
+            create_default_rules(instance=project, created=True, RuleModel=Rule)
 
     def backwards(self, orm):
         pass
@@ -199,7 +200,7 @@ class Migration(DataMigration):
         },
         'sentry.rule': {
             'Meta': {'object_name': 'Rule'},
-            'data': ('django.db.models.fields.TextField', [], {}),
+            'data': ('sentry.db.models.fields.gzippeddict.GzippedDictField', [], {}),
             'date_added': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now'}),
             'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
             'label': ('django.db.models.fields.CharField', [], {'max_length': '64'}),

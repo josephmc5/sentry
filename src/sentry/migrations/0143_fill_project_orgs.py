@@ -4,6 +4,14 @@ from south.db import db
 from south.v2 import DataMigration
 from django.db import IntegrityError, models, transaction
 
+def atomic_save(model):
+    try:
+        with transaction.atomic():
+            model.save()
+    except transaction.TransactionManagementError:
+        # sqlite isn't happy
+        model.save()
+
 class Migration(DataMigration):
 
     def forwards(self, orm):
@@ -21,8 +29,7 @@ class Migration(DataMigration):
             project.organization = project.team.organization
 
             try:
-                with transaction.atomic():
-                    project.save()
+                atomic_save(project)
             except IntegrityError:
                 # we also need to update the slug here based on the new constraints
                 slugify_instance(project, project.name, (
@@ -79,7 +86,7 @@ class Migration(DataMigration):
         'sentry.auditlogentry': {
             'Meta': {'object_name': 'AuditLogEntry'},
             'actor': ('sentry.db.models.fields.FlexibleForeignKey', [], {'related_name': "'audit_actors'", 'to': "orm['sentry.User']"}),
-            'data': ('django.db.models.fields.TextField', [], {}),
+            'data': ('sentry.db.models.fields.gzippeddict.GzippedDictField', [], {}),
             'datetime': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now'}),
             'event': ('django.db.models.fields.PositiveIntegerField', [], {}),
             'id': ('sentry.db.models.fields.BoundedBigAutoField', [], {'primary_key': 'True'}),
@@ -289,7 +296,7 @@ class Migration(DataMigration):
         },
         'sentry.rule': {
             'Meta': {'object_name': 'Rule'},
-            'data': ('django.db.models.fields.TextField', [], {}),
+            'data': ('sentry.db.models.fields.gzippeddict.GzippedDictField', [], {}),
             'date_added': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now'}),
             'id': ('sentry.db.models.fields.BoundedBigAutoField', [], {'primary_key': 'True'}),
             'label': ('django.db.models.fields.CharField', [], {'max_length': '64'}),
