@@ -8,9 +8,9 @@ from pkg_resources import parse_version as Version
 
 from sentry import options
 from sentry.models import (
-    Organization, OrganizationMemberType, Project, User, Team, ProjectKey,
-    UserOption, TagKey, TagValue, GroupTagValue, GroupTagKey, Activity,
-    Alert
+    Organization, OrganizationMember, OrganizationMemberType, Project, User,
+	Team, TeamMember, ProjectKey, UserOption, TagKey, TagValue, GroupTagValue,
+	GroupTagKey, Activity, Alert
 )
 from sentry.signals import buffer_incr_complete, regression_signal
 from sentry.utils.safe import safe_execute
@@ -196,11 +196,10 @@ def on_alert_creation(instance, **kwargs):
         safe_execute(plugin.on_alert, alert=instance)
 
 def add_user_to_projects(request, user, **kwargs):
-    for team in Team.objects.all():
-        if not Project.objects.filter(id=settings.SENTRY_PROJECT,team=team).exists():
-            TeamMember.objects.get_or_create(
-                user=user,
-                team=team)
+    for organization in Organization.objects.all():
+        OrganizationMember.objects.get_or_create(
+          user=user,
+          organization=organization)
 
 # Signal registration
 post_syncdb.connect(
